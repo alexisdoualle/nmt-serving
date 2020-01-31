@@ -1,0 +1,3 @@
+OpenNMT-tf==2.5.1
+jsonschema
+https://github.com/SYSTRAN/storages/archive/221fdea969473f10289f628e173b24c528c287d7.tar.gz
