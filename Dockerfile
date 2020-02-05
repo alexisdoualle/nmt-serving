@@ -27,5 +27,6 @@ RUN python3 -m pip --no-cache-dir install -r /root/base_requirements.txt -r /roo
 
 ADD entrypoint.py /root
 ADD nmtwizard /root/nmtwizard
+COPY test2_transformer_model /root/models/
 
 ENTRYPOINT ["python3", "entrypoint.py"]

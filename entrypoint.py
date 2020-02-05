@@ -204,4 +204,5 @@ def _list_checkpoint_files(model_dir):
 
 
 if __name__ == '__main__':
+    print('************************ MAIN')
     OpenNMTTFFramework().run()

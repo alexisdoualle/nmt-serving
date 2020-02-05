@@ -125,7 +125,7 @@ class Utility(object):
         raise NotImplementedError()
 
     def run(self, args=None):
-        return True
+        # return True
         """Main entrypoint."""
         parser = argparse.ArgumentParser()
         parser.add_argument('-s', '--storage_config', default=None,
@@ -270,6 +270,7 @@ def load_model_config(model_dir):
         return json.load(config_file)
 
 def check_model_dir(model_dir, check_integrity_fn):
+    print(os.listdir())
     """Compares model package MD5."""
     logger.info("Checking integrity of model package %s", model_dir)
     md5_file = os.path.join(model_dir, "checksum.md5")
@@ -284,6 +285,13 @@ def check_model_dir(model_dir, check_integrity_fn):
 
 def fetch_model(storage, remote_model_path, model_path, check_integrity_fn):
     """Downloads the remote model."""
+    # print("************ FETCH MODEL")
+    # print(os.getcwd())
+    # os.chdir("/root/models/")
+    # print(os.getcwd())
+    # print("\n")
+    # print([d for d in os.listdir(os.getcwd())])
+    # print("\n")
     storage.get(remote_model_path, model_path, directory=True,
                 check_integrity_fn=lambda m: check_model_dir(m, check_integrity_fn))
     os.environ['MODEL_DIR'] = model_path
