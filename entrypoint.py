@@ -5,6 +5,7 @@ import shutil
 from nmtwizard.logger import get_logger
 
 import tensorflow as tf
+
 import opennmt
 
 from nmtwizard.framework import Framework
@@ -27,6 +28,7 @@ class OpenNMTTFFramework(Framework):
               src_vocab_info,
               tgt_vocab_info,
               align_file=None,
+              example_weights_file=None,
               model_path=None,
               gpuid=0):
         if model_path is None or tf.train.latest_checkpoint(model_path) is None:
@@ -43,18 +45,26 @@ class OpenNMTTFFramework(Framework):
             src_file=src_file,
             tgt_file=tgt_file,
             align_file=align_file,
+            example_weights_file=example_weights_file,
             model_path=model_path)
 
         if prev_src_vocab or prev_tgt_vocab:
             previous_model_dir = runner.model_dir
-            runner.update_vocab(
-                os.path.join(self._output_dir, 'new_vocab_checkpoint'),
-                src_vocab=src_vocab_info.current if prev_src_vocab else None,
-                tgt_vocab=tgt_vocab_info.current if prev_tgt_vocab else None)
+            # Update the model vocabulary on CPU to avoid initializing the GPU context
+            # and allow batch size autotuning to run properly afterwards.
+            with tf.device("cpu"):
+                runner.update_vocab(
+                    os.path.join(self._output_dir, 'new_vocab_checkpoint'),
+                    src_vocab=src_vocab_info.current if prev_src_vocab else None,
+                    tgt_vocab=tgt_vocab_info.current if prev_tgt_vocab else None)
             shutil.rmtree(previous_model_dir)
 
-        output_dir = runner.train(num_devices=utils.count_devices(gpuid))
-        return _list_checkpoint_files(output_dir)
+        output_dir, summary = runner.train(
+            num_devices=utils.count_devices(gpuid),
+            return_summary=True,
+            fallback_to_cpu=False,
+        )
+        return _list_checkpoint_files(output_dir), summary
 
     def trans(self, config, model_path, input, output, gpuid=0):
         runner = self._build_runner(config, model_path=model_path)
@@ -77,10 +87,10 @@ class OpenNMTTFFramework(Framework):
         translate_fn = tf.saved_model.load(export_dir).signatures['serving_default']
         return None, translate_fn
 
-    def forward_request(self, batch_inputs, info, timeout=None):
-        translate_fn = info
+    def forward_request(self, model_info, inputs, outputs=None, options=None):
+        translate_fn = model_info
 
-        tokens, lengths = utils.pad_lists(batch_inputs, padding_value='')
+        tokens, lengths = utils.pad_lists(inputs, padding_value='')
         outputs = translate_fn(
             tokens=tf.constant(tokens, dtype=tf.string),
             length=tf.constant(lengths, dtype=tf.int32))
@@ -103,10 +113,10 @@ class OpenNMTTFFramework(Framework):
 
     def _map_vocab_entry(self, index, token, vocab):
         if index == 0:
-            vocab.write(b'<blank>\n')
-            vocab.write(b'<s>\n')
-            vocab.write(b'</s>\n')
-        vocab.write(b'%s\n' % token)
+            vocab.write('<blank>\n')
+            vocab.write('<s>\n')
+            vocab.write('</s>\n')
+        vocab.write('%s\n' % token)
 
     def _build_runner(self,
                       config,
@@ -115,8 +125,10 @@ class OpenNMTTFFramework(Framework):
                       src_file=None,
                       tgt_file=None,
                       align_file=None,
+                      example_weights_file=None,
                       model_path=None):
         model_dir = os.path.join(self._output_dir, 'model')
+        os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
         if os.path.exists(model_dir):
             shutil.rmtree(model_dir)
         os.makedirs(model_dir)
@@ -129,9 +141,9 @@ class OpenNMTTFFramework(Framework):
 
         # Prepare vocabulary if not already done.
         if src_vocab is None:
-            src_vocab = self._convert_vocab(config['tokenization']['source']['vocabulary'])
+            src_vocab = self._convert_vocab(config['vocabulary']['source']['path'])
         if tgt_vocab is None:
-            tgt_vocab = self._convert_vocab(config['tokenization']['target']['vocabulary'])
+            tgt_vocab = self._convert_vocab(config['vocabulary']['target']['path'])
 
         options = config['options']
         run_config = _build_run_config(
@@ -141,16 +153,20 @@ class OpenNMTTFFramework(Framework):
             tgt_vocab,
             src_file=src_file,
             tgt_file=tgt_file,
-            align_file=align_file)
+            align_file=align_file,
+            example_weights_file=example_weights_file)
         model = opennmt.load_model(
             model_dir,
             model_file=options.get('model'),
             model_name=options.get('model_type'),
-            serialize_model=False)
+            as_builder=True,
+        )
         return opennmt.Runner(
             model,
             run_config,
-            auto_config=options.get('auto_config', False))
+            auto_config=options.get('auto_config', False),
+            mixed_precision=options.get('mixed_precision', False),
+        )
 
 
 def _build_run_config(config,
@@ -159,7 +175,8 @@ def _build_run_config(config,
                       tgt_vocab,
                       src_file=None,
                       tgt_file=None,
-                      align_file=None):
+                      align_file=None,
+                      example_weights_file=None):
     """Builds the final configuration for OpenNMT-tf."""
     config = opennmt.convert_to_v2_config(config) if config else {}
     config['model_dir'] = model_dir
@@ -175,6 +192,8 @@ def _build_run_config(config,
         data['train_alignments'] = align_file
         params = config.setdefault('params', {})
         params.setdefault('guided_alignment_type', 'ce')
+    if example_weights_file is not None and os.path.exists(example_weights_file):
+        data['example_weights'] = example_weights_file
 
     train = config.setdefault('train', {})
     train.setdefault('sample_buffer_size', -1)
@@ -204,5 +223,4 @@ def _list_checkpoint_files(model_dir):
 
 
 if __name__ == '__main__':
-    print('************************ MAIN')
     OpenNMTTFFramework().run()

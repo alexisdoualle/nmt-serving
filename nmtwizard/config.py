@@ -1,8 +1,9 @@
 """Functions to manipulate and validate configurations."""
 
+import collections
 import jsonschema
 import six
-
+import copy
 
 def merge_config(a, b):
     """Merges config b in a."""
@@ -17,6 +18,33 @@ def merge_config(a, b):
                 a[key] = b_value
     return a
 
+def replace_config(a, b):
+    """Updates fields in a by fields in b."""
+    a.update(b)
+    return a
+
+_non_user_fields = {'model', 'modelType', 'imageTag', 'build', 'parent_model'}
+
+def update_config(a, b, mode='default'):
+    """Update the configuration a with b."""
+    if not b:
+        return a
+
+    from_version = get_config_version(a)
+    to_version = get_config_version(b)
+    if from_version == 1 and to_version == 2:
+        # When updating the configuration to a newer version, we clear all user fields.
+        a = {k:v for k, v in a.items() if k in _non_user_fields}
+        return replace_config(a, b)
+
+    if mode == 'default':
+        mode = 'merge' if from_version == 1 else 'replace'
+    if mode == 'merge':
+        return merge_config(a, b)
+    if mode == 'replace':
+        return replace_config(a, b)
+    raise ValueError('Invalid configuration update mode: %s' % mode)
+
 def index_config(config, path, index_structure=True):
     """Index a configuration with a path-like string."""
     key = None
@@ -30,10 +58,16 @@ def index_config(config, path, index_structure=True):
                 raise ValueError('Invalid path %s in config' % path)
             config = config[section]
         elif isinstance(config, list):
+            section_index = None
             try:
                 section_index = int(section)
             except ValueError:
-                raise ValueError('Expected an array index in path, but got %s instead' % section)
+                for i, block in enumerate(config):
+                    if isinstance(block, dict) and block.get('name') == section:
+                        section_index = i
+                        break
+                if section_index is None:
+                    raise ValueError('Expected an array index in path, but got %s instead' % section)
             config = config[section_index]
         else:
             raise ValueError('Paths in config can only represent object and array structures')
@@ -41,6 +75,27 @@ def index_config(config, path, index_structure=True):
         return config
     else:
         return config, key
+
+def build_override(config, path, value):
+    """Builds a configuration override to update the value at path."""
+    if not path:
+        return value
+    sections = path.split('/')
+    section = sections[0]
+    inner_path = '/'.join(sections[1:])
+    if isinstance(config, dict):
+        return {section: build_override(config.get(section), inner_path, value)}
+    if isinstance(config, list):
+        index = int(sections[0])
+        override = build_override(config[index], inner_path, value)
+        # Since lists can't be merged, the override should contain the full list content.
+        config = list(config)
+        if isinstance(override, dict):
+            config[index] = merge_config(copy.deepcopy(config[index]), override)
+        else:
+            config[index] = override
+        return config
+    raise TypeError('Paths in config can only represent object and array structures')
 
 def index_schema(schema, path):
     """Index a JSON schema with a path-like string."""
@@ -82,9 +137,14 @@ def validate_mapping(schema, options, config):
             raise ValueError('Missing "option_path" in option mapping %d' % i)
         option_schema = index_schema(schema, option_path)
 
-def update_config_with_options(config, options):
-    """Update the configuration with incoming inference options. Raises ValueError
-    if inference options were not expected or the value is not accepted.
+def read_options(config, options):
+    """Reads the inference options.
+
+    For V1 configurations, this function returns a configuration override.
+    For V2 configurations, this function returns a dict mapping operator names to their options.
+
+    Raises:
+      ValueError: if inference options were not expected or the value is not accepted.
     """
     inference_options = config.get('inference_options')
     if inference_options is None:
@@ -93,10 +153,77 @@ def update_config_with_options(config, options):
         jsonschema.validate(options, inference_options['json_schema'])
     except jsonschema.ValidationError as e:
         raise ValueError('Options validation error: %s' % e.message)
+    v2_config = is_v2_config(config)
+    operators_options = collections.defaultdict(dict)
+    config_override = {}
     for mapping in inference_options['options']:
         try:
             option_value = index_config(options, mapping['option_path'])
         except ValueError:
             continue  # Option not passed for this request.
-        dst_config, dst_key = index_config(config, mapping['config_path'], index_structure=False)
-        dst_config[dst_key] = option_value
+        if v2_config:
+            dst_config, dst_key = index_config(config, mapping['config_path'], index_structure=False)
+            operators_options[dst_config['name']].update({dst_key: option_value})
+        else:
+            merge_config(
+                config_override, build_override(config, mapping['config_path'], option_value))
+    if v2_config:
+        return operators_options
+    return config_override
+
+def is_v2_config(config):
+    """Returns True if config is a V2 configuration."""
+    preprocess = config.get("preprocess")
+    return ("tokenization" not in config
+            and preprocess is not None
+            and isinstance(preprocess, list))
+
+def is_v1_config(config):
+    """Returns True if config is a V1 configuration."""
+    return not is_v2_config(config)
+
+def get_config_version(config):
+    """Returns the version of the configuration."""
+    return 2 if is_v2_config(config) else 1
+
+def old_to_new_config(config):
+    """Locally update old configuration with 'tokenization' field to include new 'vocabulary' and 'preprocess" fields.
+    """
+    if not config:
+        return
+    tok_config = config.get("tokenization")
+    new_config = config
+    if tok_config :
+        if "vocabulary" not in config:
+            new_config = copy.deepcopy(config)
+            vocab_src = tok_config["source"].get("vocabulary", None)
+            vocab_tgt = tok_config["target"].get("vocabulary", None)
+            replace_src = tok_config["source"].get("replace_vocab", False)
+            replace_tgt = tok_config["target"].get("replace_vocab", False)
+            prev_vocab_src = tok_config["source"].get("previous_vocabulary", None)
+            prev_vocab_tgt = tok_config["target"].get("previous_vocabulary", None)
+
+            if vocab_src or vocab_tgt:
+                new_config["vocabulary"] = {}
+            if vocab_src:
+                new_config["vocabulary"]["source"] = { "path": vocab_src, "replace_vocab" : replace_src }
+            if vocab_tgt:
+                new_config["vocabulary"]["target"] = { "path": vocab_tgt, "replace_vocab": replace_tgt }
+            if prev_vocab_src:
+                new_config["vocabulary"]["source"]["previous_vocabulary"] = prev_vocab_src
+            if prev_vocab_tgt:
+                new_config["vocabulary"]["target"]["previous_vocabulary"] = prev_vocab_tgt
+
+        if "preprocess" not in config:
+            new_tok_config = copy.deepcopy(tok_config)
+            new_tok_config["source"].pop("vocabulary", None)
+            new_tok_config["target"].pop("vocabulary", None)
+            new_config["preprocess"] = [
+                {
+                    "op":"tokenization",
+                    "source": new_tok_config["source"],
+                    "target": new_tok_config["target"]
+                }
+            ]
+
+    return new_config

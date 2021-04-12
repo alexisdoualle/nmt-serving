@@ -1,3 +1,2 @@
-OpenNMT-tf==2.5.1
-jsonschema
-https://github.com/SYSTRAN/storages/archive/221fdea969473f10289f628e173b24c528c287d7.tar.gz
+tensorflow-gpu==2.3.*
+https://github.com/OpenNMT/OpenNMT-tf/archive/12a3c55ccf2bb246f6dc236b012ee04611e99f24.tar.gz

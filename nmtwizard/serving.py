@@ -8,6 +8,7 @@ import copy
 import socket
 import time
 import six
+import os
 
 from six.moves import SimpleHTTPServer
 from six.moves import socketserver
@@ -27,11 +28,35 @@ class TranslationOutput(object):
 
 class TranslationExample(
         collections.namedtuple("TranslationExample",
-                               ("config", "tokens", "metadata"))):
+                               (
+                                   "index",
+                                   "config",
+                                   "options",
+                                   "source_tokens",
+                                   "target_tokens",
+                                   "mode",
+                                   "metadata",
+                               ))):
 
     @property
     def num_parts(self):
-        return len(self.tokens)
+        return len(self.source_tokens)
+
+class TranslationBatch(
+        collections.namedtuple("TranslationBatch",
+                               (
+                                   "indices",
+                                   "source_tokens",
+                                   "target_tokens",
+                                   "mode",
+                               ))):
+    pass
+
+class InvalidRequest(Exception):
+    pass
+
+class TranslationTimeout(Exception):
+    pass
 
 def pick_free_port():
     """Selects an available port."""
@@ -42,11 +67,12 @@ def pick_free_port():
 def start_server(host,
                  port,
                  config,
-                 serving_state,
                  backend_service_fn,
-                 preprocess_fn,
                  translate_fn,
-                 postprocess_fn):
+                 preprocessor=None,
+                 postprocessor=None,
+                 backend_info_fn=None,
+                 rebatch_request=True):
     """Start a serving service.
 
     This function will only return on SIGINT or SIGTERM signals.
@@ -54,24 +80,54 @@ def start_server(host,
     Args:
       host: The hostname of the service.
       port: The port used by the service.
-      serving_state: The framework state to propagate to pre/postprocessing callbacks.
       backend_service_fn: A callable to start the framework dependent backend service.
-      preprocess_fn: A callable taking (serving_state, text, config) and returning tokens.
       translation_fn: A callable that forwards the request to the translation backend.
-      postprocess_fn: A callable taking (serving_state, src_tokens, tgt_tokens, config)
-        and returning text.
+      backend_info_fn: A callable returning some information about the backend service,
+        and whether it can accept new requests or not.
+      preprocessor: A Processor instance for preprocessing.
+      postprocessor: A Processor instance for postprocessing.
+      rebatch_request: If True, incoming requests are rebatched according to
+        max_batch_size. Otherwise, max_batch_size is passed as a translation option
+        to translate_fn which takes responsibility over batching.
     """
+    os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = "true"
     global backend_process
     global backend_info
     backend_process, backend_info = backend_service_fn()
-    global_timeout = None
-    global_max_batch_size = None
     serving_config = config.get('serving')
-    if serving_config is not None and isinstance(serving_config, dict):
-        global_timeout = config.get('timeout')
-        global_max_batch_size = config.get('max_batch_size')
+    if serving_config is None:
+        serving_config = {}
+    global_timeout = serving_config.get('timeout')
+    global_max_batch_size = serving_config.get('max_batch_size')
+
+    def _backend_is_reachable():
+        return (backend_info is not None
+                and backend_process is None or _process_is_running(backend_process))
 
     class ServerHandler(SimpleHTTPServer.SimpleHTTPRequestHandler):
+        def _send_response(self, data, status=200):
+            self.send_response(status)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(six.ensure_binary(json.dumps(data)))
+
+        def _send_error(self, status, message, from_request=None):
+            if from_request is not None:
+                logger.exception(
+                    "Exception raised for request:\n%s",
+                    json.dumps(from_request, ensure_ascii=False),
+                )
+            data = {"message": message}
+            self._send_response(data, status=status)
+
+        def do_GET(self):
+            if self.path == '/status':
+                self.status()
+            elif self.path == '/health':
+                self.health()
+            else:
+                self._send_error(404, 'invalid route %s' % self.path)
+
         def do_POST(self):
             if self.path == '/translate':
                 self.translate()
@@ -80,39 +136,57 @@ def start_server(host,
             elif self.path == '/reload_model':
                 self.reload_model()
             else:
-                self.send_error(404, 'invalid route %s' % self.path)
+                self._send_error(404, 'invalid route %s' % self.path)
 
         def translate(self):
-            global backend_process
-            if backend_process is not None and not _process_is_running(backend_process):
-                self.send_error(503, 'backend service is unavailable')
+            if not _backend_is_reachable():
+                self._send_error(503, 'backend service is unavailable')
                 return
             header_fn = (
                 self.headers.getheader if hasattr(self.headers, "getheader")
                 else self.headers.get)
             content_len = int(header_fn('content-length', 0))
             if content_len == 0:
-                self.send_error(400, 'missing request data')
+                self._send_error(400, 'missing request data')
                 return
             post_body = self.rfile.read(content_len)
+            request = None
             try:
+                request = json.loads(six.ensure_str(post_body))
                 result = run_request(
-                    json.loads(six.ensure_str(post_body)),
-                    functools.partial(preprocess_fn, serving_state),
-                    functools.partial(translate_fn, info=backend_info),
-                    functools.partial(postprocess_fn, serving_state),
+                    request,
+                    functools.partial(translate_fn, backend_info),
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
                     config=config,
+                    rebatch_request=rebatch_request,
                     max_batch_size=global_max_batch_size,
                     timeout=global_timeout)
-            except ValueError as e:
-                self.send_error(400, str(e))
-            except RuntimeError as e:
-                self.send_error(504, str(e))
+            except InvalidRequest as e:
+                self._send_error(400, str(e), from_request=request)
+            except TranslationTimeout as e:
+                self._send_error(504, str(e), from_request=request)
+            except Exception as e:
+                self._send_error(500, str(e), from_request=request)
             else:
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(six.ensure_binary(json.dumps(result)))
+                self._send_response(result)
+
+        def health(self):
+            if not _backend_is_reachable():
+                self._send_error(503, 'backend service is unavailable')
+                return
+            if backend_info_fn is None:
+                self._send_response({})
+                return
+            info, available = backend_info_fn(serving_config, backend_info)
+            self._send_response(info, status=200 if available else 503)
+
+        def status(self):
+            if backend_info is None:
+                status = "unloaded"
+            else:
+                status = "ready"
+            self._send_response({"status": status})
 
         def unload_model(self):
             global backend_process
@@ -121,7 +195,7 @@ def start_server(host,
                 backend_process.terminate()
             backend_process = None
             backend_info = None
-            self.send_response(200)
+            self.status()
 
         def reload_model(self):
             global backend_process
@@ -129,7 +203,7 @@ def start_server(host,
             if backend_process is not None and _process_is_running(backend_process):
                 backend_process.terminate()
             backend_process, backend_info = backend_service_fn()
-            self.send_response(200)
+            self.status()
 
     try:
         frontend_server = socketserver.ThreadingTCPServer((host, port), ServerHandler)
@@ -155,10 +229,11 @@ def start_server(host,
 
 
 def run_request(request,
-                preprocess_fn,
                 translate_fn,
-                postprocess_fn,
+                preprocessor=None,
+                postprocessor=None,
                 config=None,
+                rebatch_request=True,
                 max_batch_size=None,
                 timeout=None):
     """Runs a translation request."""
@@ -166,98 +241,150 @@ def run_request(request,
         logger.debug("Incoming request: %s", json.dumps(request, ensure_ascii=False))
 
     if not isinstance(request, dict):
-        raise ValueError('request should be a JSON object')
+        raise InvalidRequest('request should be a JSON object')
     src = request.get('src')
     if src is None:
-        raise ValueError('missing src field')
+        raise InvalidRequest('missing src field')
     if not isinstance(src, list):
-        raise ValueError('src field must be a list')
+        raise InvalidRequest('src field must be a list')
 
     if not src:
         results = []
     else:
         # Read request specific options and config.
         options = request.get('options', {})
-        config = finalize_config(config, override=options.get('config'))
+        options.setdefault('timeout', timeout)
         max_batch_size = options.get('max_batch_size', max_batch_size)
-        timeout = options.get('timeout', timeout)
+        if not rebatch_request and max_batch_size is not None:
+            options['max_batch_size'] = max_batch_size
+            max_batch_size = None
 
-        examples = preprocess_examples(src, preprocess_fn, config=config)
+        examples = preprocess_examples(
+            src,
+            preprocessor,
+            config=config,
+            config_override=options.get('config'))
         outputs = translate_examples(
             examples,
             translate_fn,
             max_batch_size=max_batch_size,
-            timeout=timeout)
-        results = postprocess_outputs(outputs, examples, postprocess_fn)
+            options=options)
+        results = postprocess_outputs(outputs, examples, postprocessor)
 
     return {'tgt': results}
 
-def finalize_config(config, override=None, options=None):
-    """Finalizes the configuration with possible override and options."""
-    if config is not None and (override or options):
-        config = copy.deepcopy(config)
-        if override:
-            config_util.merge_config(config, override)
-        if options:
-            config_util.update_config_with_options(config, options)
-    return config
+def preprocess_example(preprocessor, index, raw_example, config=None, config_override=None):
+    """Applies preprocessing function on example."""
+    if not isinstance(raw_example, dict):
+        raise InvalidRequest('example %d is not a JSON object' % index)
+    source_text = raw_example.get('text')
+    if source_text is None:
+        raise InvalidRequest('missing text field in example %d' % index)
+    mode = raw_example.get('mode', 'default')
 
-def preprocess_text(text, func, config=None):
-    """Applies preprocessing function on text."""
-    output = func(text, config)
+    options = None
+    example_config_override = raw_example.get('config')
 
-    # Preprocessing may return additional metadata alongside tokens.
-    if isinstance(output, tuple):
-        tokens, metadata = output
+    # Resolve example options.
+    if config is not None:
+        example_options = raw_example.get('options')
+        if example_options:
+            options_or_override = config_util.read_options(config, example_options)
+            if config_util.is_v2_config(config):
+                options = options_or_override
+            else:
+                example_config_override = config_util.merge_config(
+                    example_config_override or {}, options_or_override)
+
+    # Merge example-level config override into batch-level config override.
+    if example_config_override:
+        if config_override:
+            config_override = config_util.merge_config(
+                copy.deepcopy(config_override), example_config_override)
+        else:
+            config_override = example_config_override
+
+    target_prefix = raw_example.get('target_prefix')
+    target_fuzzy = raw_example.get('fuzzy')
+    if target_prefix is not None and target_fuzzy is not None:
+        raise InvalidRequest("Using both a target prefix and a fuzzy target is currently unsupported")
+
+    target_text = None
+    target_name = None
+    if target_prefix is not None:
+        target_text = target_prefix
+    elif target_fuzzy is not None:
+        supported_features = config.get('supported_features') if config else None
+        if supported_features is not None and supported_features.get("NFA", False):
+            target_text = target_fuzzy
+            target_name = "fuzzy"
+        else:
+            logger.warning("The fuzzy target is ignored because this model does not "
+                           "support Neural Fuzzy Adaptation")
+
+    if preprocessor is None:
+        source_tokens = source_text
+        target_tokens = None
+        metadata = None
     else:
-        tokens, metadata = output, None
+        source_tokens, target_tokens, metadata = preprocessor.process_input(
+            source_text,
+            target=target_text,
+            target_name=target_name,
+            config=config_override,
+            options=options,
+        )
 
     # Move to the general multiparts representation.
-    if not tokens or not isinstance(tokens[0], list):
-        tokens = [tokens]
+    if not source_tokens or not isinstance(source_tokens[0], list):
+        source_tokens = [source_tokens]
+        target_tokens = [target_tokens]
         metadata = [metadata]
 
     return TranslationExample(
-        config=config,
-        tokens=tokens,
+        index=index,
+        config=config_override,
+        options=options,
+        source_tokens=source_tokens,
+        target_tokens=target_tokens,
+        mode=mode,
         metadata=metadata)
 
-def preprocess_examples(raw_examples, func, config=None):
+def preprocess_examples(raw_examples, preprocessor, config=None, config_override=None):
     """Applies preprocessing on a list of example structures."""
     examples = []
     for i, raw_example in enumerate(raw_examples):
-        if not isinstance(raw_example, dict):
-            raise ValueError('example %d is not a JSON object' % i)
-        text = raw_example.get('text')
-        if text is None:
-            raise ValueError('missing text field in example %d' % i)
-        example_config = finalize_config(
-            config,
-            override=raw_example.get('config'),
-            options=raw_example.get('options'))
-        example = preprocess_text(text, func, config=example_config)
+        example = preprocess_example(
+            preprocessor, i, raw_example, config=config, config_override=config_override)
         examples.append(example)
     return examples
 
-def postprocess_output(output, example, func):
+def postprocess_output(output, example, postprocessor):
     """Applies postprocessing function on a translation output."""
-    if example.num_parts > 1:
-        # For multi parts inputs, send all parts to the postprocessing.
-        tgt_tokens = output.output
-        src_context = (example.tokens, example.metadata)
-        score = sum(output.score) if all(s is not None for s in output.score) else None
+
+    # Send all parts to the postprocessing.
+    if postprocessor is None:
+        text = output.output[0]
+        score = None
         align = None
     else:
-        # Otherwise just take the first element and pass metadata only if defined.
-        tgt_tokens = output.output[0]
-        src_tokens = example.tokens[0]
-        src_metadata = example.metadata[0]
-        src_context = src_tokens if src_metadata is None else (src_tokens, src_metadata)
-        score = output.score[0]
-        attention = output.attention[0]
-        align = align_tokens(src_tokens, tgt_tokens, attention) if attention else None
+        tgt_tokens = output.output
+        src_tokens = example.source_tokens
+        text = postprocessor.process_input(
+            src_tokens,
+            tgt_tokens,
+            metadata=example.metadata,
+            config=example.config,
+            options=example.options,
+        )
+        score = sum(output.score) if all(s is not None for s in output.score) else None
+        attention = output.attention
+        if attention and len(attention) == 1:
+            attention = attention[0]
+            align = align_tokens(src_tokens, tgt_tokens, attention) if attention else None
+        else:
+            align = None
 
-    text = func(src_context, tgt_tokens, example.config)
     result = {'text': text}
     if score is not None:
         result['score'] = score
@@ -265,12 +392,12 @@ def postprocess_output(output, example, func):
         result['align'] = align
     return result
 
-def postprocess_outputs(outputs, examples, func):
+def postprocess_outputs(outputs, examples, postprocessor):
     """Applies postprocess on model outputs."""
     results = []
     for hypotheses, example in zip(outputs, examples):
         results.append([
-            postprocess_output(hypothesis, example, func)
+            postprocess_output(hypothesis, example, postprocessor)
             for hypothesis in hypotheses])
     return results
 
@@ -294,46 +421,64 @@ def align_tokens(src_tokens, tgt_tokens, attention):
             "src": [{"range": src_range, "id": src_id}]})
     return alignments
 
-def translate_examples(examples, func, max_batch_size=None, timeout=None):
+def translate_examples(examples, func, max_batch_size=None, options=None):
     """Translates examples."""
-    flat_outputs = []
+    if options is None:
+        options = {}
+    hypotheses_per_example = collections.defaultdict(list)
     for batch in batch_iterator(examples, max_batch_size=max_batch_size):
-        hypotheses = func(batch, timeout=timeout)
-        if hypotheses is None:
-            raise RuntimeError('translation request timed out')
-        flat_outputs.extend(hypotheses)
-    return unflatten_outputs(flat_outputs, examples)
+        batch_options = options.copy()
+        batch_options['mode'] = batch.mode
+        batch_hypotheses = func(batch.source_tokens, batch.target_tokens, batch_options)
+        if batch_hypotheses is None:
+            raise TranslationTimeout('translation failed or timed out')
+
+        # Gather hypotheses by example id.
+        for index, hypotheses in zip(batch.indices, batch_hypotheses):
+            hypotheses_per_example[index].append(hypotheses)
+
+    # Merge multi-part hypotheses.
+    outputs = []
+    for index, hypotheses in six.iteritems(hypotheses_per_example):
+        num_hypotheses = len(hypotheses[0])
+        outputs.insert(
+            index,
+            [merge_translation_outputs(part[h] for part in hypotheses)
+             for h in range(num_hypotheses)])
+
+    return outputs
 
 def batch_iterator(examples, max_batch_size=None):
     """Yields batch of tokens not larger than max_batch_size."""
-    all_tokens = []
+    examples_per_mode = collections.defaultdict(list)
     for example in examples:
-        all_tokens.extend(example.tokens)
-    batch_size = len(all_tokens)
-    if max_batch_size is None or batch_size <= max_batch_size:
-        yield all_tokens
-    else:
-        offset = 0
-        while offset < batch_size:
-            lower_bound = offset
-            upper_bound = min(offset + max_batch_size, batch_size)
-            yield all_tokens[lower_bound:upper_bound]
-            offset = upper_bound
-
-def unflatten_outputs(flat_outputs, examples):
-    """Unflattens outputs according to examples parts."""
-    outputs = []
-    offset = 0
-    for example in examples:
-        num_parts = example.num_parts
-        hypotheses = flat_outputs[offset:offset + num_parts]
-        offset += num_parts
-        # Extract and merge parts of each hypothesis.
-        num_hypotheses = len(hypotheses[0])
-        outputs.append([
-            merge_translation_outputs([part[h] for part in hypotheses])
-            for h in range(num_hypotheses)])
-    return outputs
+        examples_per_mode[example.mode].append(example)
+    for mode, examples in six.iteritems(examples_per_mode):
+        indices = []
+        source_tokens = []
+        target_tokens = []
+        for example in examples:
+            indices.extend(example.index for _ in range(example.num_parts))
+            source_tokens.extend(example.source_tokens)
+            target_tokens.extend(example.target_tokens)
+        batch_size = len(source_tokens)
+        if max_batch_size is None or batch_size <= max_batch_size:
+            yield TranslationBatch(
+                indices=indices,
+                source_tokens=source_tokens,
+                target_tokens=target_tokens,
+                mode=mode)
+        else:
+            offset = 0
+            while offset < batch_size:
+                lower_bound = offset
+                upper_bound = min(offset + max_batch_size, batch_size)
+                yield TranslationBatch(
+                    indices=indices[lower_bound:upper_bound],
+                    source_tokens=source_tokens[lower_bound:upper_bound],
+                    target_tokens=target_tokens[lower_bound:upper_bound],
+                    mode=mode)
+                offset = upper_bound
 
 def merge_translation_outputs(parts):
     """Merges multiple translation outputs in a single one."""

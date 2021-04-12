@@ -13,6 +13,7 @@ import sys
 import requests
 import io
 import tempfile
+import functools
 
 from nmtwizard.beat_service import start_beat_service
 from nmtwizard.utils import md5files
@@ -70,7 +71,7 @@ def resolve_remote_files(config, local_dir, storage_client):
         if not isinstance(value, six.string_types) or not storage_client.is_managed_path(value):
             return value
         storage_id, remote_path = storage_client.parse_managed_path(value)
-        if remote_path[0] == '/':
+        if remote_path and remote_path[0] == '/':
             remote_path = remote_path[1:]
         local_path = os.path.join(local_dir, storage_id, remote_path)
         # can be a file or a directory
@@ -125,7 +126,6 @@ class Utility(object):
         raise NotImplementedError()
 
     def run(self, args=None):
-        # return True
         """Main entrypoint."""
         parser = argparse.ArgumentParser()
         parser.add_argument('-s', '--storage_config', default=None,
@@ -155,10 +155,18 @@ class Utility(object):
         parser.add_argument('-c', '--config', default=None,
                             help=('Configuration as a file or a JSON string. '
                                   'Setting "-" will read from the standard input.'))
+        parser.add_argument('--config_update_mode',
+                            choices=['default', 'merge', 'replace'],
+                            default='default',
+                            help=('How to update the parent task configuration with the given '
+                                  'configuration. '
+                                  '"default": automatic mode based on the configuration, '
+                                  '"merge": recursively update configuration fields, '
+                                  '"replace": replace the top-most fields.'))
         parser.add_argument('-m', '--model', default=None,
                             help='Model to load.')
         parser.add_argument('-g', '--gpuid', default="0",
-                            help="Comma-separated list of 1-indexed GPU identifiers (0 for CPU).")
+                            help="Comma-separated list of 0-indexed GPU identifiers.")
         parser.add_argument('--no_push', default=False, action='store_true',
                             help='Do not push model.')
 
@@ -204,7 +212,7 @@ class Utility(object):
         start_time = time.time()
         stats = self.exec_function(args)
         end_time = time.time()
-        logger.info('Finished executing utility in %s seconds', str(end_time-start_time))
+        logger.info('Finished executing utility in %.1f seconds', end_time-start_time)
 
         if args.statistics_url is not None:
             requests.post(args.statistics_url, json={
@@ -230,7 +238,7 @@ class Utility(object):
         return new_val
 
 
-def build_model_dir(model_dir, objects, config, check_integrity_fn):
+def build_model_dir(model_dir, objects, config, should_check_integrity_fn):
     """Prepares the model directory based on the model package."""
     if os.path.exists(model_dir):
         raise ValueError("model directory %s already exists" % model_dir)
@@ -249,7 +257,7 @@ def build_model_dir(model_dir, objects, config, check_integrity_fn):
         with io.open(readme_path, 'w', encoding='utf-8') as readme_file:
             readme_file.write(config['description'])
         objects['README.md'] = readme_path
-    md5 = md5files((k, v) for k, v in six.iteritems(objects) if check_integrity_fn(k))
+    md5 = md5files((k, v) for k, v in six.iteritems(objects) if should_check_integrity_fn(k))
     with open(os.path.join(model_dir, "checksum.md5"), "w") as f:
         f.write(md5)
 
@@ -269,30 +277,27 @@ def load_model_config(model_dir):
     with open(config_path, 'r') as config_file:
         return json.load(config_file)
 
-def check_model_dir(model_dir, check_integrity_fn):
-    print(os.listdir())
+def check_model_dir(should_check_integrity_fn, model_dir, force=False):
     """Compares model package MD5."""
     logger.info("Checking integrity of model package %s", model_dir)
     md5_file = os.path.join(model_dir, "checksum.md5")
     if not os.path.exists(md5_file):
-        return True
+        return not force
     md5ref = None
     with open(md5_file, "r") as f:
         md5ref = f.read().strip()
     files = os.listdir(model_dir)
-    md5check = md5files([(f, os.path.join(model_dir, f)) for f in files if check_integrity_fn(f)])
+    md5check = md5files([
+        (f, os.path.join(model_dir, f)) for f in files if should_check_integrity_fn(f)])
     return md5check == md5ref
 
-def fetch_model(storage, remote_model_path, model_path, check_integrity_fn):
+def fetch_model(storage, remote_model_path, model_path, should_check_integrity_fn):
     """Downloads the remote model."""
-    # print("************ FETCH MODEL")
-    # print(os.getcwd())
-    # os.chdir("/root/models/")
-    # print(os.getcwd())
-    # print("\n")
-    # print([d for d in os.listdir(os.getcwd())])
-    # print("\n")
-    storage.get(remote_model_path, model_path, directory=True,
-                check_integrity_fn=lambda m: check_model_dir(m, check_integrity_fn))
+    check_integrity_fn = functools.partial(check_model_dir, should_check_integrity_fn)
+    storage.get(
+        remote_model_path,
+        model_path,
+        directory=True,
+        check_integrity_fn=check_integrity_fn)
     os.environ['MODEL_DIR'] = model_path
     return load_model_config(model_path)
