@@ -14,8 +14,8 @@ rm:
 	sudo docker rm wezenmt-serving
 
 rn:
-	sudo docker run -p 5000:5000 --gpus all -v `pwd`/models:/root/models --name wezenmt-serving wezenmt-serving \
-    --model_storage /root/models --model istores_transformer_model serve --host 0.0.0.0 --port 5000
+	sudo docker run -p 5000:5000 -v `pwd`/models:/root/models --name wezenmt-serving wezenmt-serving \
+    --model_storage /root/models --model models serve --host 0.0.0.0 --port 5000
 
 rnOLD:
 	@echo "Lauching WezenMT serving docker"

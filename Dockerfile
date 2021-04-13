@@ -1,4 +1,5 @@
-FROM nvidia/cuda:10.1-cudnn7-runtime-ubuntu18.04
+# FROM nvidia/cuda:10.1-cudnn7-runtime-ubuntu18.04
+FROM opennmt/tensorflow-serving:2.1.0
 
 WORKDIR /root
 
@@ -7,8 +8,8 @@ ENV LANG=C.UTF-8
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        libnvinfer6=6.0.1-1+cuda10.1 \
-        libnvinfer-plugin6=6.0.1-1+cuda10.1 \
+        # libnvinfer6=6.0.1-1+cuda10.1 \
+        # libnvinfer-plugin6=6.0.1-1+cuda10.1 \
         python3-distutils \
         wget \
         && \
